@@ -5,7 +5,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 #[derive(CustomResource, Deserialize, Serialize, Clone, Debug, Default, JsonSchema)]
-#[kube(kind = "Dataset", version = "v1", group = "ketzu.net")]
+#[kube(kind = "Dataset", version = "v1", group = "ketzu.net", namespaced)]
 #[kube(status = "DatasetStatus")]
 pub struct DatasetSpec {
     pub name: String,
