@@ -1,12 +1,18 @@
 mod crds;
 
-use std::{sync::Arc, time::Duration};
+use crate::crds::DatasetStatus;
+use crds::Dataset;
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, PersistentVolumeClaimSpec};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta};
-use kube::{Api, Client, ResourceExt, runtime::controller::{Action, Controller}, Resource};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use k8s_openapi::chrono;
 use kube::api::{Patch, PatchParams};
-use crds::Dataset;
+use kube::{
+    Api, Client, Resource, ResourceExt,
+    runtime::controller::{Action, Controller},
+};
+use serde_json::json;
+use std::{sync::Arc, time::Duration};
 
 #[derive(Clone)]
 struct Context {
@@ -17,13 +23,17 @@ struct Context {
 pub enum Error {
     #[error("owner reference could not be created")]
     OwnerReferenceFailed,
+    #[error("unknown status")]
+    UnknownStatus,
     #[error(transparent)]
     KubeError(#[from] kube::Error),
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 fn create_owned_pvc(obj: &Dataset) -> Result<PersistentVolumeClaim> {
-    let owner_ref = obj.controller_owner_ref(&()).ok_or(Error::OwnerReferenceFailed)?;
+    let owner_ref = obj
+        .controller_owner_ref(&())
+        .ok_or(Error::OwnerReferenceFailed)?;
     Ok(PersistentVolumeClaim {
         metadata: ObjectMeta {
             name: Some(obj.spec.name.clone()),
@@ -33,28 +43,68 @@ fn create_owned_pvc(obj: &Dataset) -> Result<PersistentVolumeClaim> {
         spec: Some(PersistentVolumeClaimSpec {
             access_modes: Some(vec!["ReadWriteOnce".into()]),
             ..obj.spec.storage.clone().unwrap_or_default()
-        })
-        ,
+        }),
         ..Default::default()
     })
 }
 
-async fn reconcile(obj: Arc<Dataset>, ctx: Arc<Context>) -> Result<Action> {
-    println!("reconcile request: {}", obj.name_any());
-    // Request head for dataset url to get size of file
-    
+async fn update_status(obj: &Dataset, api: &Api<Dataset>, phase: &str) -> Result<()> {
+    let status = json!({
+        "status": DatasetStatus {
+            phase: phase.into(),
+            last_updated: Some(chrono::Utc::now()),
+        }   
+    });
+    api.patch_status(
+        obj.name_any().as_str(),
+        &PatchParams::default(),
+        &Patch::Merge(&status),
+    )
+    .await?;
+    Ok(())
+}
 
-    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), obj.namespace().unwrap_or("default".to_string()).as_str());
-
-    let pvc_data = create_owned_pvc(&obj)?;
-    println!("pvc: {:?}", pvc_data);
-    
+async fn patch_pvc(
+    pvc_data: PersistentVolumeClaim,
+    api: &Api<PersistentVolumeClaim>,
+) -> Result<()> {
     let patch_params = PatchParams::apply("dataset-controller");
     let patch = Patch::Apply(pvc_data.clone());
-    let _pvc = pvcs.patch(pvc_data.name_any().as_str(), &patch_params, &patch).await?;
+    api.patch(pvc_data.name_any().as_str(), &patch_params, &patch)
+        .await?;
+    Ok(())
+}
 
-    println!("pvc: {:?}", _pvc);
-    
+async fn reconcile(obj: Arc<Dataset>, ctx: Arc<Context>) -> Result<Action> {
+    println!("reconcile request: {}", obj.name_any());
+    let api: Api<Dataset> = Api::namespaced(
+        ctx.client.clone(),
+        obj.namespace().unwrap_or("default".to_string()).as_str(),
+    );
+
+    if obj.status.is_none() {
+        update_status(&obj,&api,"Initializing").await?;
+        return Ok(Action::requeue(Duration::from_secs(5)));
+    }
+
+    match obj.status.as_ref().unwrap().phase.as_str() {
+        "Initializing" => {
+            let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(
+                ctx.client.clone(),
+                obj.namespace().unwrap_or("default".to_string()).as_str(),
+            );
+
+            let pvc_data = create_owned_pvc(&obj)?;
+            patch_pvc(pvc_data, &pvcs).await?;
+
+            update_status(&obj, &api,"PVC Created").await?;
+        }
+        "PVC Created" => {
+            println!("PVC already exists");
+        }
+        _ => return Err(Error::UnknownStatus),
+    }
+
     Ok(Action::requeue(Duration::from_secs(3600)))
 }
 
