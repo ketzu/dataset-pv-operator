@@ -3,7 +3,7 @@ mod crds;
 use crate::crds::DatasetStatus;
 use crds::Dataset;
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, PersistentVolumeClaimSpec};
+use k8s_openapi::api::core::v1::{Container, PersistentVolumeClaim, PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use k8s_openapi::chrono;
 use kube::api::{Patch, PatchParams};
@@ -13,6 +13,7 @@ use kube::{
 };
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
+use k8s_openapi::api::batch::v1::{Job, JobSpec, JobTemplateSpec};
 
 #[derive(Clone)]
 struct Context {
@@ -43,6 +44,35 @@ fn create_owned_pvc(obj: &Dataset) -> Result<PersistentVolumeClaim> {
         spec: Some(PersistentVolumeClaimSpec {
             access_modes: Some(vec!["ReadWriteOnce".into()]),
             ..obj.spec.storage.clone().unwrap_or_default()
+        }),
+        ..Default::default()
+    })
+}
+
+fn create_owned_job(obj: &Dataset) -> Result<Job> {
+    let owner_ref = obj.controller_owner_ref(&()).ok_or(Error::OwnerReferenceFailed)?;
+    Ok(Job {
+        metadata: ObjectMeta {
+            name: Some(obj.spec.name.clone()),
+            owner_references: Some(vec![owner_ref]),
+            ..ObjectMeta::default()
+        },
+        spec: Some(JobSpec {
+            template: PodTemplateSpec {
+                spec: Some(PodSpec {
+                    containers: vec![
+                        Container {
+                            name: "Downloader".into(),
+                            image:  Some("alpine/curl".into()), // should be a parameter
+                            command: Some(vec!["curl".into(), "-L".into(), "-o".into(), "/mounted/dataset".into(), obj.spec.url.clone()]),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
         }),
         ..Default::default()
     })
